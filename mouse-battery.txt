@@ -1,0 +1,112 @@
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles; using System.Collections.Generic; using System.Threading;
+public static class LogiFinal {
+    const uint GENERIC_READ=0x80000000; const uint GENERIC_WRITE=0x40000000;
+    const uint FILE_SHARE_READ=1; const uint FILE_SHARE_WRITE=2; const uint OPEN_EXISTING=3;
+    const uint DIGCF_PRESENT=2; const uint DIGCF_DEVICEINTERFACE=0x10; const uint FILE_FLAG_OVERLAPPED=0x40000000; const uint WAIT_OBJECT_0=0;
+    const byte SW_ID=0x0A;
+    [StructLayout(LayoutKind.Sequential)] struct SP_DEVICE_INTERFACE_DATA { public uint cbSize; public Guid G; public uint F; public IntPtr R; }
+    [StructLayout(LayoutKind.Sequential)] struct HIDD_ATTRIBUTES { public uint Size; public ushort VendorID; public ushort ProductID; public ushort Ver; }
+    [StructLayout(LayoutKind.Sequential)] struct HIDP_CAPS {
+        public ushort Usage; public ushort UsagePage; public ushort InputLen; public ushort OutputLen; public ushort FeatureLen;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst=17)] public ushort[] Reserved; public ushort N1,N2,N3,N4,N5,N6,N7,N8,N9,N10;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct OVERLAPPED { public UIntPtr I1; public UIntPtr I2; public uint Off; public uint OffH; public IntPtr hEvent; }
+    [DllImport("hid.dll")] static extern void HidD_GetHidGuid(out Guid g);
+    [DllImport("setupapi.dll", CharSet=CharSet.Auto, SetLastError=true)] static extern IntPtr SetupDiGetClassDevs(ref Guid cg, IntPtr e, IntPtr h, uint f);
+    [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiEnumDeviceInterfaces(IntPtr di, IntPtr dd, ref Guid g, uint mi, ref SP_DEVICE_INTERFACE_DATA d);
+    [DllImport("setupapi.dll", CharSet=CharSet.Auto, SetLastError=true)] static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr di, ref SP_DEVICE_INTERFACE_DATA d, IntPtr det, uint sz, ref uint req, IntPtr dn);
+    [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr di);
+    [DllImport("kernel32.dll", CharSet=CharSet.Auto, SetLastError=true)] static extern SafeFileHandle CreateFile(string f, uint a, uint s, IntPtr sec, uint c, uint fl, IntPtr t);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool WriteFile(SafeFileHandle h, byte[] b, uint n, out uint w, ref OVERLAPPED ov);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadFile(SafeFileHandle h, byte[] b, uint n, out uint r, ref OVERLAPPED ov);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetOverlappedResult(SafeFileHandle h, ref OVERLAPPED ov, out uint r, bool wait);
+    [DllImport("kernel32.dll")] static extern IntPtr CreateEvent(IntPtr s, bool m, bool i, IntPtr n);
+    [DllImport("kernel32.dll")] static extern bool ResetEvent(IntPtr h);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll")] static extern bool CancelIo(SafeFileHandle h);
+    [DllImport("hid.dll")] static extern bool HidD_GetAttributes(SafeFileHandle h, ref HIDD_ATTRIBUTES a);
+    [DllImport("hid.dll")] static extern bool HidD_GetPreparsedData(SafeFileHandle h, out IntPtr p);
+    [DllImport("hid.dll")] static extern bool HidD_FreePreparsedData(IntPtr p);
+    [DllImport("hid.dll")] static extern int  HidP_GetCaps(IntPtr p, ref HIDP_CAPS c);
+    static SafeFileHandle OpenIface(IntPtr di, ref Guid hg, uint cbSz, ushort up, ushort u) {
+        for (uint idx=0;;idx++) {
+            var ifd=new SP_DEVICE_INTERFACE_DATA(); ifd.cbSize=(uint)Marshal.SizeOf(ifd);
+            if (!SetupDiEnumDeviceInterfaces(di,IntPtr.Zero,ref hg,idx,ref ifd)) break;
+            uint sz=0; SetupDiGetDeviceInterfaceDetail(di,ref ifd,IntPtr.Zero,0,ref sz,IntPtr.Zero); if(sz==0)continue;
+            IntPtr dp=Marshal.AllocHGlobal((int)sz); for(int b=0;b<(int)sz;b++)Marshal.WriteByte(dp,b,0);
+            Marshal.WriteInt32(dp,(int)cbSz); SetupDiGetDeviceInterfaceDetail(di,ref ifd,dp,sz,ref sz,IntPtr.Zero);
+            string path=Marshal.PtrToStringUni(new IntPtr(dp.ToInt64()+4)); Marshal.FreeHGlobal(dp);
+            if (string.IsNullOrEmpty(path)) continue;
+            var h=CreateFile(path,GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,IntPtr.Zero);
+            if (h.IsInvalid) continue;
+            bool keep=false;
+            try {
+                var at=new HIDD_ATTRIBUTES{Size=(uint)Marshal.SizeOf(typeof(HIDD_ATTRIBUTES))};
+                if(!HidD_GetAttributes(h,ref at)||at.VendorID!=0x046D||at.ProductID!=0xC53F){h.Close();continue;}
+                IntPtr pp; if(!HidD_GetPreparsedData(h,out pp)){h.Close();continue;}
+                var caps=new HIDP_CAPS(); HidP_GetCaps(pp,ref caps); HidD_FreePreparsedData(pp);
+                if(caps.UsagePage==up&&caps.Usage==u){keep=true;return h;}
+            } finally { if(!keep)h.Close(); }
+        }
+        return null;
+    }
+    static bool OvWrite(SafeFileHandle dev, IntPtr evt, byte[] data) {
+        ResetEvent(evt); var ov=new OVERLAPPED(); ov.hEvent=evt; uint w;
+        WriteFile(dev,data,(uint)data.Length,out w,ref ov);
+        WaitForSingleObject(evt,1000); GetOverlappedResult(dev,ref ov,out w,false); return w==(uint)data.Length;
+    }
+    static byte[] OvRead(SafeFileHandle dev, IntPtr evt, int ms, int len) {
+        ResetEvent(evt); var rb=new byte[len]; uint r=0; var ov=new OVERLAPPED(); ov.hEvent=evt;
+        ReadFile(dev,rb,(uint)len,out r,ref ov);
+        if(WaitForSingleObject(evt,(uint)ms)==WAIT_OBJECT_0){GetOverlappedResult(dev,ref ov,out r,false);if(r>0)return rb;}
+        CancelIo(dev); return null;
+    }
+    static byte[] LongCmd(SafeFileHandle dev, IntPtr evt, byte devIdx, byte featIdx, byte fn, byte p0=0, byte p1=0, byte p2=0) {
+        var msg=new byte[20]; msg[0]=0x11; msg[1]=devIdx; msg[2]=featIdx; msg[3]=(byte)((fn<<4)|SW_ID); msg[4]=p0; msg[5]=p1; msg[6]=p2;
+        OvWrite(dev,evt,msg);
+        for(int i=0;i<20;i++){var rb=OvRead(dev,evt,800,20);if(rb!=null&&rb[1]==devIdx&&rb[2]==featIdx&&(rb[3]&0x0F)==SW_ID)return rb;if(rb==null)break;}
+        return null;
+    }
+    public static string Run() {
+        uint cbSz=(uint)(IntPtr.Size==8?8:6); Guid hg; HidD_GetHidGuid(out hg);
+        var di=SetupDiGetClassDevs(ref hg,IntPtr.Zero,IntPtr.Zero,DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
+        var shortDev=OpenIface(di,ref hg,cbSz,0xFF00,0x0001);
+        var longDev =OpenIface(di,ref hg,cbSz,0xFF00,0x0002);
+        SetupDiDestroyDeviceInfoList(di);
+        if(shortDev==null||longDev==null) return "Could not open receiver interfaces";
+        IntPtr evt=CreateEvent(IntPtr.Zero,true,false,IntPtr.Zero);
+        using(shortDev) using(longDev) {
+            for(int i=0;i<5;i++){OvRead(shortDev,evt,80,7);OvRead(longDev,evt,80,20);}
+            OvWrite(shortDev,evt,new byte[]{0x10,0xFF,0x80,0x02,0x02,0x00,0x00});
+            byte devIdx=0;
+            for(int i=0;i<10;i++){var rb=OvRead(shortDev,evt,400,7);if(rb==null)break;if(rb[2]==0x41){devIdx=rb[1];break;}}
+            if(devIdx==0)devIdx=1;
+            Thread.Sleep(300);
+            var r1=LongCmd(longDev,evt,devIdx,0x00,0,0x00,0x01,0x00);
+            if(r1==null){CloseHandle(evt);return "Device not responding";}
+            byte fsetIdx=r1[4];
+            var r2=LongCmd(longDev,evt,devIdx,fsetIdx,0);
+            if(r2==null){CloseHandle(evt);return "Failed feature count";}
+            byte nF=r2[4];
+            var fm=new Dictionary<int,byte>();
+            for(byte fi=0;fi<=nF;fi++){var rf=LongCmd(longDev,evt,devIdx,fsetIdx,1,fi,0,0);if(rf!=null)fm[(rf[4]<<8)|rf[5]]=fi;}
+            foreach(int bf in new[]{0x1000,0x1004,0x1001}){
+                if(!fm.ContainsKey(bf))continue;
+                byte fn=(bf==0x1004)?(byte)1:(byte)0;
+                var rb=LongCmd(longDev,evt,devIdx,fm[bf],fn);
+                if(rb==null)continue;
+                string[]st={"Discharging","Charging","Charging","Full"};
+                string status=rb[6]<st.Length?st[rb[6]]:"Unknown";
+                CloseHandle(evt);
+                return string.Format("Battery: {0}%  ({1})",rb[4],status);
+            }
+            string fl=""; foreach(var kv in fm)fl+=string.Format("0x{0:X4} ",kv.Key);
+            CloseHandle(evt);
+            return "Battery feature not found. Features: "+fl;
+        }
+    }
+}
+'@ -Language CSharp
+[LogiFinal]::Run()
